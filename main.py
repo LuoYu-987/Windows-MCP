@@ -2,6 +2,7 @@ from live_inspect.watch_cursor import WatchCursor
 from contextlib import asynccontextmanager
 from fastmcp.utilities.types import Image
 from src.desktop.service import Desktop
+from src.desktop.launch_cn_plus import ChineseLauncher
 from humancursor import SystemCursor
 from markdownify import markdownify
 from textwrap import dedent
@@ -20,6 +21,7 @@ pg.PAUSE=1.0
 desktop=Desktop()
 cursor=SystemCursor()
 watch_cursor=WatchCursor()
+cn_launcher=ChineseLauncher()  # 中文智能启动器
 windows_version=desktop.get_windows_version()
 default_language=desktop.get_default_language()
 
@@ -52,6 +54,62 @@ def launch_tool(name: str) -> str:
         else:
             return response
     return f'Launching {name.title()} wait for it to come load.'
+
+@mcp.tool(name='Launch-CN-Tool', description='智能启动程序（中文增强版）- 支持中文名、英文名、拼音全拼、拼音首字母搜索，扫描开始菜单、PATH环境变量、Program Files、注册表、快捷方式等。示例: "记事本", "jishiben", "jsb", "notepad"')
+def launch_cn_tool(name: str, force_reindex: bool = False) -> str:
+    """
+    中文智能启动器
+
+    支持多种搜索方式:
+    - 中文名: "记事本", "谷歌浏览器"
+    - 英文名: "notepad", "chrome"
+    - 拼音全拼: "jishiben", "gugeLiulanqi"
+    - 拼音首字母: "jsb", "ggllq"
+
+    Args:
+        name: 程序名称（支持中文、英文、拼音）
+        force_reindex: 强制重新扫描程序索引（首次使用或安装新程序后使用）
+    """
+    response, status = cn_launcher.launch(name, force_reindex=force_reindex)
+    if status != 0:
+        return response
+
+    # 等待程序启动
+    consecutive_waits = 2
+    for _ in range(consecutive_waits):
+        if not desktop.is_app_running(name):
+            pg.sleep(1.0)
+        else:
+            return response
+    return response
+
+@mcp.tool(name='Search-Program-Tool', description='搜索程序（不启动）- 返回匹配的程序列表，支持中文、英文、拼音搜索。用于查看有哪些程序可以启动。')
+def search_program_tool(query: str, limit: int = 5) -> str:
+    """
+    搜索程序（不启动）
+
+    Args:
+        query: 搜索关键词
+        limit: 返回结果数量（默认5个）
+
+    Returns:
+        匹配的程序列表
+    """
+    results = cn_launcher.search(query, limit=limit)
+
+    if not results:
+        return f'未找到匹配 "{query}" 的程序'
+
+    output = [f'找到 {len(results)} 个匹配 "{query}" 的程序:\n']
+    for i, candidate in enumerate(results, 1):
+        output.append(f'{i}. {candidate.display_name}')
+        output.append(f'   来源: {candidate.source}')
+        output.append(f'   路径: {candidate.executable_path}')
+        if candidate.aliases:
+            output.append(f'   别名: {", ".join(candidate.aliases[:3])}')
+        output.append('')
+
+    return '\n'.join(output)
     
 @mcp.tool(name='Powershell-Tool', description='Execute PowerShell commands and return the output with status code')
 def powershell_tool(command: str) -> str:
