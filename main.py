@@ -55,7 +55,7 @@ def launch_tool(name: str) -> str:
             return response
     return f'Launching {name.title()} wait for it to come load.'
 
-@mcp.tool(name='Launch-CN-Tool', description='智能启动程序（中文增强版）- 支持中文名、英文名、拼音全拼、拼音首字母搜索，扫描开始菜单、PATH环境变量、Program Files、注册表、快捷方式等。示例: "记事本", "jishiben", "jsb", "notepad"')
+@mcp.tool(name='Launch-CN-Tool', description='智能启动程序（中文增强版）示例: "记事本", "jishiben", "jsb", "notepad"')
 def launch_cn_tool(name: str, force_reindex: bool = False) -> str:
     """
     中文智能启动器
