@@ -13,6 +13,7 @@ import pyautogui as pg
 import pyperclip as pc
 import requests
 import asyncio
+import threading
 import click
 
 pg.FAILSAFE=False
@@ -24,6 +25,23 @@ watch_cursor=WatchCursor()
 cn_launcher=ChineseLauncher()  # 中文智能启动器
 windows_version=desktop.get_windows_version()
 default_language=desktop.get_default_language()
+
+# 后台预索引 - 如果缓存未命中,启动后台线程进行快速索引
+def preindex_programs():
+    """后台预索引程序列表"""
+    if not cn_launcher._indexed:
+        print("[Info] 启动后台快速索引...")
+        cn_launcher._build_quick_index()
+
+    # 在后台继续完成完整索引
+    if not cn_launcher._full_indexed:
+        print("[Info] 启动后台完整索引...")
+        cn_launcher._build_full_index()
+
+# 启动后台索引线程 (如果需要)
+if not cn_launcher._indexed:
+    index_thread = threading.Thread(target=preindex_programs, daemon=True, name="ProgramIndexer")
+    index_thread.start()
 
 instructions=dedent(f'''
 Windows MCP server provides tools to interact directly with the {windows_version} desktop, 

@@ -24,8 +24,9 @@ import json
 import locale
 import subprocess
 import winreg
+import time
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Tuple, Optional, Set
 from fuzzywuzzy import process as fuzz_process
 
@@ -208,9 +209,16 @@ class ChineseLauncher:
         # 候选程序缓存
         self._candidates: List[ProgramCandidate] = []
         self._indexed = False
+        self._full_indexed = False  # 是否完成完整索引
 
         # 使用频率统计（用于优化匹配优先级）
         self._usage_stats: Dict[str, int] = self._load_usage_stats()
+
+        # 尝试加载缓存
+        if enable_cache:
+            cache_loaded = self._load_index_cache()
+            if cache_loaded:
+                print(f"[Info] 从缓存加载了 {len(self._candidates)} 个程序 (耗时 <100ms)")
 
     # ==================== 公共 API ====================
 
@@ -225,14 +233,25 @@ class ChineseLauncher:
         Returns:
             (结果消息, 状态码)
         """
-        # 构建索引
-        if not self._indexed or force_reindex:
+        # 强制重新索引
+        if force_reindex:
             self._build_index()
+        # 如果未索引,至少执行快速索引
+        elif not self._indexed:
+            print("[Info] 首次使用,正在快速索引程序...")
+            self._build_quick_index()
 
         # 匹配程序
         candidate = self._match_program(query)
         if not candidate:
-            return (f"未找到程序: '{query}'", 1)
+            # 如果未找到且未完成完整索引,尝试完整索引
+            if not self._full_indexed:
+                print(f"[Info] 快速索引中未找到 '{query}',正在进行完整索引...")
+                self._build_full_index()
+                candidate = self._match_program(query)
+
+            if not candidate:
+                return (f"未找到程序: '{query}'", 1)
 
         # 启动程序
         result, code = self._start_program(candidate)
@@ -254,30 +273,58 @@ class ChineseLauncher:
         Returns:
             候选程序列表
         """
+        # 如果未索引,至少执行快速索引
         if not self._indexed:
-            self._build_index()
+            print("[Info] 首次搜索,正在快速索引程序...")
+            self._build_quick_index()
 
         return self._fuzzy_match(query, limit=limit)
 
     # ==================== 索引构建 ====================
 
-    def _build_index(self):
-        """构建程序索引"""
+    def _build_quick_index(self):
+        """快速索引 - 仅索引最常用的来源（开始菜单 + PATH）"""
+        print("[Info] 开始快速索引...")
+        start_time = time.time()
+
         self._candidates.clear()
 
-        # 1. 开始菜单程序
+        # 1. 开始菜单程序 (最常用，UWP应用和传统应用)
         try:
             self._candidates.extend(self._index_start_menu())
         except Exception as e:
             print(f"[Warning] Index start menu failed: {e}")
 
-        # 2. PATH 环境变量
+        # 2. PATH 环境变量 (命令行工具)
         try:
             self._candidates.extend(self._index_path_env())
         except Exception as e:
             print(f"[Warning] Index PATH failed: {e}")
 
-        # 3. 常见安装路径扫描
+        # 去重
+        self._candidates = self._deduplicate(self._candidates)
+        self._indexed = True
+
+        elapsed = time.time() - start_time
+        print(f"[Info] 快速索引完成: {len(self._candidates)} 个程序 (耗时 {elapsed:.2f}s)")
+
+        # 保存缓存
+        if self.enable_cache:
+            self._save_index_cache()
+
+    def _build_full_index(self):
+        """完整索引 - 包含所有来源（注册表、常见路径、快捷方式）"""
+        if self._full_indexed:
+            return
+
+        print("[Info] 开始完整索引...")
+        start_time = time.time()
+
+        # 确保已有基础索引
+        if not self._indexed:
+            self._build_quick_index()
+
+        # 3. 常见安装路径扫描 (耗时操作)
         try:
             self._candidates.extend(self._index_common_paths())
         except Exception as e:
@@ -289,7 +336,7 @@ class ChineseLauncher:
         except Exception as e:
             print(f"[Warning] Index registry failed: {e}")
 
-        # 5. 快捷方式
+        # 5. 快捷方式 (最耗时操作)
         try:
             self._candidates.extend(self._index_shortcuts())
         except Exception as e:
@@ -297,9 +344,21 @@ class ChineseLauncher:
 
         # 去重
         self._candidates = self._deduplicate(self._candidates)
-        self._indexed = True
+        self._full_indexed = True
 
-        print(f"[Info] Indexed {len(self._candidates)} programs")
+        elapsed = time.time() - start_time
+        print(f"[Info] 完整索引完成: {len(self._candidates)} 个程序 (额外耗时 {elapsed:.2f}s)")
+
+        # 更新缓存
+        if self.enable_cache:
+            self._save_index_cache()
+
+    def _build_index(self):
+        """构建程序索引（兼容旧代码，调用完整索引）"""
+        if not self._indexed:
+            self._build_quick_index()
+        if not self._full_indexed:
+            self._build_full_index()
 
     def _index_start_menu(self) -> List[ProgramCandidate]:
         """索引开始菜单程序"""
@@ -646,6 +705,83 @@ class ChineseLauncher:
                 json.dump(self._usage_stats, f, ensure_ascii=False, indent=2)
         except:
             pass
+
+    def _load_index_cache(self) -> bool:
+        """
+        加载索引缓存
+
+        Returns:
+            bool: 是否成功加载缓存
+        """
+        cache_file = Path.home() / '.windows_mcp_program_cache.json'
+        if not cache_file.exists():
+            return False
+
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            # 检查缓存是否过期 (24小时)
+            cache_age = time.time() - data.get('timestamp', 0)
+            if cache_age > 86400:  # 24 * 60 * 60
+                print(f"[Info] 缓存已过期 ({cache_age / 3600:.1f} 小时), 将重新索引")
+                return False
+
+            # 恢复候选程序列表
+            candidates_data = data.get('candidates', [])
+            self._candidates = []
+            for item in candidates_data:
+                try:
+                    # 处理旧缓存格式兼容性
+                    candidate = ProgramCandidate(
+                        display_name=item.get('display_name', ''),
+                        executable_path=item.get('executable_path', ''),
+                        source=item.get('source', 'cache'),
+                        aliases=item.get('aliases', []),
+                        metadata=item.get('metadata', {})
+                    )
+                    self._candidates.append(candidate)
+                except Exception as e:
+                    print(f"[Warning] 跳过无效缓存条目: {e}")
+                    continue
+
+            self._indexed = True
+            self._full_indexed = data.get('full_indexed', False)
+
+            return len(self._candidates) > 0
+
+        except Exception as e:
+            print(f"[Warning] 加载缓存失败: {e}")
+            return False
+
+    def _save_index_cache(self):
+        """保存索引缓存"""
+        cache_file = Path.home() / '.windows_mcp_program_cache.json'
+
+        try:
+            # 转换为可序列化格式
+            candidates_data = []
+            for candidate in self._candidates:
+                try:
+                    candidates_data.append(asdict(candidate))
+                except Exception as e:
+                    print(f"[Warning] 跳过序列化失败的候选项: {e}")
+                    continue
+
+            data = {
+                'timestamp': time.time(),
+                'full_indexed': self._full_indexed,
+                'candidates': candidates_data,
+                'version': '1.0'  # 缓存格式版本
+            }
+
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            print(f"[Info] 已保存 {len(candidates_data)} 个程序到缓存")
+
+        except Exception as e:
+            print(f"[Warning] 保存缓存失败: {e}")
 
 
 # ==================== 测试代码 ====================
