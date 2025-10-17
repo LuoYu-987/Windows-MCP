@@ -1,4 +1,4 @@
-from uiautomation import Control, GetRootControl, IsIconic, IsZoomed, IsWindowVisible, ControlType, ControlFromCursor, IsTopLevelWindow, ShowWindow, ControlFromHandle
+from uiautomation import Control, GetRootControl, IsIconic, IsZoomed, IsWindowVisible, ControlType, ControlFromCursor, IsTopLevelWindow, ShowWindow, ControlFromHandle, GetForegroundWindow, SetForegroundWindow
 from src.desktop.config import EXCLUDED_APPS, AVOIDED_APPS, BROWSER_NAMES, PROCESS_PER_MONITOR_DPI_AWARE
 from src.desktop.views import DesktopState, App, Size, Status
 from PIL.Image import Image as PILImage
@@ -18,6 +18,8 @@ import base64
 import csv
 import os
 import io
+import win32process
+import win32con
 
 class Desktop:
     def __init__(self):
@@ -149,25 +151,44 @@ class Desktop:
             response,status=self.execute_command(f'Start-Process shell:AppsFolder\\{appid}')
         return response,status
     
-    def switch_app(self,name:str):
+    def switch_app(self, name: str='', handle: int=None):
         # 确保 desktop_state 已初始化
         if self.desktop_state is None:
             self.get_state()
 
         apps={app.name:app for app in [self.desktop_state.active_app]+self.desktop_state.apps if app is not None}
-        matched_app:Optional[tuple[str,float]]=process.extractOne(name,list(apps.keys()),score_cutoff=70)
-        if matched_app is None:
-            return (f'Application {name.title()} not found.',1)
-        app_name,_=matched_app
-        app=apps.get(app_name)
-        if IsIconic(app.handle):
-            ShowWindow(app.handle, cmdShow=9)
-            return (f'{app_name.title()} restored from Minimized state.',0)
+        if not handle:
+            matched_app:Optional[tuple[str,float]]=process.extractOne(name,list(apps.keys()),score_cutoff=70)
+            if matched_app is None:
+                return (f'Application {name.title()} not found.',1)
+            app_name,_=matched_app
+            app=apps.get(app_name)
+            target_handle=app.handle
         else:
-            from pywinauto import Application
-            app=Application().connect(handle=app.handle)
-            app.window().set_focus()
-            return (f'Switched to {app_name.title()} window.',0)
+            target=None
+            for app in apps.values():
+                if app.handle==handle:
+                    target=app
+                    break
+            if target is None:
+                return (f'Application with handle {handle} not found.',1)
+            app_name=target.name
+            target_handle=target.handle
+
+        foreground_handle=GetForegroundWindow()
+        foreground_thread,_=win32process.GetWindowThreadProcessId(foreground_handle)
+        target_thread,_=win32process.GetWindowThreadProcessId(target_handle)
+        win32process.AttachThreadInput(foreground_thread,target_thread,True)
+
+        if IsIconic(target_handle):
+            ShowWindow(target_handle, win32con.SW_RESTORE)
+            content=f'{app_name.title()} restored from Minimized state.'
+        else:
+            SetForegroundWindow(target_handle)
+            content=f'Switched to {app_name.title()} window.'
+            
+        win32process.AttachThreadInput(foreground_thread,target_thread,False)
+        return content,0
     
     def get_app_size(self,control:Control):
         window=control.BoundingRectangle
@@ -229,7 +250,7 @@ class Desktop:
         height = user32.GetSystemMetrics(1)
         return Size(width=width,height=height)
     
-    def screenshot_in_bytes(self,screenshot:PILImage)->bytes:
+    def screenshot_in_bytes(self,screenshot:PILImage)->str:
         buffer=BytesIO()
         screenshot.save(buffer,format='PNG')
         img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
