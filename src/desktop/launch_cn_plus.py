@@ -25,9 +25,11 @@ import locale
 import subprocess
 import winreg
 import time
+import threading
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Tuple, Optional, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fuzzywuzzy import process as fuzz_process
 
 # 尝试导入 pypinyin，如果不存在则使用降级方案
@@ -201,7 +203,7 @@ class EncodingHelper:
 class ChineseLauncher:
     """中文智能启动器"""
 
-    def __init__(self, enable_cache: bool = True):
+    def __init__(self, enable_cache: bool = True, auto_index: bool = True):
         self.encoding_helper = EncodingHelper()
         self.pinyin_matcher = PinyinMatcher()
         self.enable_cache = enable_cache
@@ -210,6 +212,14 @@ class ChineseLauncher:
         self._candidates: List[ProgramCandidate] = []
         self._indexed = False
         self._full_indexed = False  # 是否完成完整索引
+
+        # 线程安全锁
+        self._lock = threading.RLock()
+
+        # 后台索引相关
+        self._background_indexing = False
+        self._index_thread: Optional[threading.Thread] = None
+        self._executor: Optional[ThreadPoolExecutor] = None
 
         # 使用频率统计（用于优化匹配优先级）
         self._usage_stats: Dict[str, int] = self._load_usage_stats()
@@ -220,15 +230,20 @@ class ChineseLauncher:
             if cache_loaded:
                 print(f"[Info] 从缓存加载了 {len(self._candidates)} 个程序 (耗时 <100ms)")
 
+        # 在后台自动加载索引
+        if auto_index and enable_cache:
+            self._start_background_indexing()
+
     # ==================== 公共 API ====================
 
-    def launch(self, query: str, force_reindex: bool = False) -> Tuple[str, int]:
+    def launch(self, query: str, force_reindex: bool = False, wait_for_index: bool = True) -> Tuple[str, int]:
         """
         启动程序
 
         Args:
             query: 程序名称（支持中文、英文、拼音、首字母）
             force_reindex: 是否强制重新索引
+            wait_for_index: 是否等待后台索引完成（最多等待5秒）
 
         Returns:
             (结果消息, 状态码)
@@ -236,10 +251,16 @@ class ChineseLauncher:
         # 强制重新索引
         if force_reindex:
             self._build_index()
-        # 如果未索引,至少执行快速索引
+        # 如果未索引,等待后台索引或执行快速索引
         elif not self._indexed:
-            print("[Info] 首次使用,正在快速索引程序...")
-            self._build_quick_index()
+            if wait_for_index:
+                # 等待后台索引，最多5秒
+                self._wait_for_indexing(timeout=5.0)
+
+            # 如果后台索引仍未完成，执行快速索引
+            if not self._indexed:
+                print("[Info] 首次使用,正在快速索引程序...")
+                self._build_quick_index()
 
         # 匹配程序
         candidate = self._match_program(query)
@@ -262,96 +283,175 @@ class ChineseLauncher:
 
         return (result, code)
 
-    def search(self, query: str, limit: int = 5) -> List[ProgramCandidate]:
+    def search(self, query: str, limit: int = 5, wait_for_index: bool = True) -> List[ProgramCandidate]:
         """
         搜索程序（不启动）
 
         Args:
             query: 搜索关键词
             limit: 返回结果数量
+            wait_for_index: 是否等待后台索引完成
 
         Returns:
             候选程序列表
         """
-        # 如果未索引,至少执行快速索引
+        # 如果未索引,等待后台索引或执行快速索引
         if not self._indexed:
-            print("[Info] 首次搜索,正在快速索引程序...")
-            self._build_quick_index()
+            if wait_for_index:
+                # 等待后台索引，最多5秒
+                self._wait_for_indexing(timeout=5.0)
+
+            # 如果后台索引仍未完成，执行快速索引
+            if not self._indexed:
+                print("[Info] 首次搜索,正在快速索引程序...")
+                self._build_quick_index()
 
         return self._fuzzy_match(query, limit=limit)
+
+    # ==================== 后台索引管理 ====================
+
+    def _start_background_indexing(self):
+        """在后台启动索引任务"""
+        if self._background_indexing or self._indexed:
+            return
+
+        self._background_indexing = True
+        self._index_thread = threading.Thread(
+            target=self._background_index_worker,
+            daemon=True,
+            name="ProgramIndexer"
+        )
+        self._index_thread.start()
+        print("[Info] 后台索引线程已启动")
+
+    def _background_index_worker(self):
+        """后台索引工作函数"""
+        try:
+            # 第一阶段：快速索引（开始菜单 + PATH）
+            print("[Info] 后台: 正在进行快速索引...")
+            self._build_quick_index()
+
+            # 第二阶段：完整索引（注册表 + 常见路径 + 快捷方式）
+            print("[Info] 后台: 快速索引完成，正在进行完整索引...")
+            self._build_full_index()
+
+            print("[Info] 后台: 程序索引已完成")
+        except Exception as e:
+            print(f"[Error] 后台索引失败: {e}")
+        finally:
+            self._background_indexing = False
+
+    def _wait_for_indexing(self, timeout: float = 5.0) -> bool:
+        """等待后台索引完成
+
+        Args:
+            timeout: 最大等待时间（秒）
+
+        Returns:
+            bool: 是否成功获得索引
+        """
+        if self._indexed:
+            return True
+
+        if self._index_thread and self._index_thread.is_alive():
+            # 等待索引完成，但有超时限制
+            self._index_thread.join(timeout=timeout)
+
+        return self._indexed
+
+    def cleanup(self):
+        """清理资源"""
+        if self._executor:
+            self._executor.shutdown(wait=False)
 
     # ==================== 索引构建 ====================
 
     def _build_quick_index(self):
         """快速索引 - 仅索引最常用的来源（开始菜单 + PATH）"""
-        print("[Info] 开始快速索引...")
-        start_time = time.time()
+        with self._lock:
+            if self._indexed:
+                return
 
-        self._candidates.clear()
+            print("[Info] 开始快速索引...")
+            start_time = time.time()
 
-        # 1. 开始菜单程序 (最常用，UWP应用和传统应用)
-        try:
-            self._candidates.extend(self._index_start_menu())
-        except Exception as e:
-            print(f"[Warning] Index start menu failed: {e}")
+            candidates = []
 
-        # 2. PATH 环境变量 (命令行工具)
-        try:
-            self._candidates.extend(self._index_path_env())
-        except Exception as e:
-            print(f"[Warning] Index PATH failed: {e}")
+            # 使用线程池并发执行索引任务
+            if not self._executor:
+                self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="IndexWorker")
 
-        # 去重
-        self._candidates = self._deduplicate(self._candidates)
-        self._indexed = True
+            futures = {}
+            # 1. 开始菜单程序 (最常用，UWP应用和传统应用)
+            futures['startmenu'] = self._executor.submit(self._index_start_menu)
+            # 2. PATH 环境变量 (命令行工具)
+            futures['path'] = self._executor.submit(self._index_path_env)
 
-        elapsed = time.time() - start_time
-        print(f"[Info] 快速索引完成: {len(self._candidates)} 个程序 (耗时 {elapsed:.2f}s)")
+            # 收集结果
+            for name, future in futures.items():
+                try:
+                    result = future.result(timeout=30)
+                    candidates.extend(result)
+                    print(f"[Info] {name} 索引完成: {len(result)} 个程序")
+                except Exception as e:
+                    print(f"[Warning] Index {name} failed: {e}")
 
-        # 保存缓存
-        if self.enable_cache:
-            self._save_index_cache()
+            # 去重
+            self._candidates = self._deduplicate(candidates)
+            self._indexed = True
+
+            elapsed = time.time() - start_time
+            print(f"[Info] 快速索引完成: {len(self._candidates)} 个程序 (耗时 {elapsed:.2f}s)")
+
+            # 保存缓存
+            if self.enable_cache:
+                self._save_index_cache()
 
     def _build_full_index(self):
         """完整索引 - 包含所有来源（注册表、常见路径、快捷方式）"""
-        if self._full_indexed:
-            return
+        with self._lock:
+            if self._full_indexed:
+                return
 
-        print("[Info] 开始完整索引...")
-        start_time = time.time()
+            print("[Info] 开始完整索引...")
+            start_time = time.time()
 
-        # 确保已有基础索引
-        if not self._indexed:
-            self._build_quick_index()
+            # 确保已有基础索引
+            if not self._indexed:
+                self._build_quick_index()
 
-        # 3. 常见安装路径扫描 (耗时操作)
-        try:
-            self._candidates.extend(self._index_common_paths())
-        except Exception as e:
-            print(f"[Warning] Index common paths failed: {e}")
+            if not self._executor:
+                self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="FullIndexWorker")
 
-        # 4. 注册表程序
-        try:
-            self._candidates.extend(self._index_registry())
-        except Exception as e:
-            print(f"[Warning] Index registry failed: {e}")
+            # 使用线程池并发执行耗时的索引操作
+            futures = {}
+            # 3. 常见安装路径扫描 (耗时操作)
+            futures['common_paths'] = self._executor.submit(self._index_common_paths)
+            # 4. 注册表程序
+            futures['registry'] = self._executor.submit(self._index_registry)
+            # 5. 快捷方式 (最耗时操作)
+            futures['shortcuts'] = self._executor.submit(self._index_shortcuts)
 
-        # 5. 快捷方式 (最耗时操作)
-        try:
-            self._candidates.extend(self._index_shortcuts())
-        except Exception as e:
-            print(f"[Warning] Index shortcuts failed: {e}")
+            # 收集结果
+            additional_candidates = list(self._candidates)
+            for name, future in futures.items():
+                try:
+                    result = future.result(timeout=60)
+                    additional_candidates.extend(result)
+                    print(f"[Info] {name} 索引完成: {len(result)} 个程序")
+                except Exception as e:
+                    print(f"[Warning] Index {name} failed: {e}")
 
-        # 去重
-        self._candidates = self._deduplicate(self._candidates)
-        self._full_indexed = True
+            # 去重
+            self._candidates = self._deduplicate(additional_candidates)
+            self._full_indexed = True
 
-        elapsed = time.time() - start_time
-        print(f"[Info] 完整索引完成: {len(self._candidates)} 个程序 (额外耗时 {elapsed:.2f}s)")
+            elapsed = time.time() - start_time
+            print(f"[Info] 完整索引完成: {len(self._candidates)} 个程序 (额外耗时 {elapsed:.2f}s)")
 
-        # 更新缓存
-        if self.enable_cache:
-            self._save_index_cache()
+            # 更新缓存
+            if self.enable_cache:
+                self._save_index_cache()
 
     def _build_index(self):
         """构建程序索引（兼容旧代码，调用完整索引）"""
@@ -553,55 +653,59 @@ class ChineseLauncher:
         if not query:
             return []
 
-        # 计算每个候选程序的得分
-        scored_candidates = []
+        # 使用锁确保线程安全
+        with self._lock:
+            # 计算每个候选程序的得分
+            scored_candidates = []
 
-        for candidate in self._candidates:
-            max_score = 0
+            for candidate in self._candidates:
+                max_score = 0
 
-            # 对所有名称变体计算匹配分数
-            for name in candidate.all_names():
-                score = self.pinyin_matcher.match_score(query, name)
-                max_score = max(max_score, score)
+                # 对所有名称变体计算匹配分数
+                for name in candidate.all_names():
+                    score = self.pinyin_matcher.match_score(query, name)
+                    max_score = max(max_score, score)
 
-            if max_score > 0:
-                # 考虑使用频率加权
-                usage_bonus = self._usage_stats.get(candidate.display_name, 0) * 2
-                final_score = max_score + usage_bonus
-                scored_candidates.append((final_score, candidate))
+                if max_score > 0:
+                    # 考虑使用频率加权
+                    usage_bonus = self._usage_stats.get(candidate.display_name, 0) * 2
+                    final_score = max_score + usage_bonus
+                    scored_candidates.append((final_score, candidate))
 
-        # 按得分排序
-        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+            # 按得分排序
+            scored_candidates.sort(key=lambda x: x[0], reverse=True)
 
-        # 如果最高分太低，尝试传统模糊匹配
-        if not scored_candidates or scored_candidates[0][0] < 50:
-            fallback = self._fallback_fuzzy_match(query, limit)
-            if fallback:
-                return fallback
+            # 如果最高分太低，尝试传统模糊匹配
+            if not scored_candidates or scored_candidates[0][0] < 50:
+                fallback = self._fallback_fuzzy_match(query, limit)
+                if fallback:
+                    return fallback
 
-        return [c for _, c in scored_candidates[:limit]]
+            return [c for _, c in scored_candidates[:limit]]
 
     def _fallback_fuzzy_match(self, query: str, limit: int = 5) -> List[ProgramCandidate]:
         """降级模糊匹配（使用 fuzzywuzzy）"""
-        name_to_candidate = {}
-        names = []
+        # 线程安全地访问候选程序列表
+        with self._lock:
+            name_to_candidate = {}
+            names = []
 
-        for candidate in self._candidates:
-            for name in candidate.all_names():
-                if name not in name_to_candidate:
-                    name_to_candidate[name] = candidate
-                    names.append(name)
+            for candidate in self._candidates:
+                for name in candidate.all_names():
+                    if name not in name_to_candidate:
+                        name_to_candidate[name] = candidate
+                        names.append(name)
 
-        matches = fuzz_process.extract(query, names, limit=limit)
-        results = []
+            matches = fuzz_process.extract(query, names, limit=limit)
+            results = []
 
-        for name, score in matches:
-            if score >= 60:
-                candidate = name_to_candidate[name]
-                if candidate not in results:
-                    results.append(candidate)
+            for name, score in matches:
+                if score >= 60:
+                    candidate = name_to_candidate[name]
+                    if candidate not in results:
+                        results.append(candidate)
 
-        return results[:limit]
+            return results[:limit]
 
     # ==================== 程序启动 ====================
 
@@ -721,9 +825,9 @@ class ChineseLauncher:
             with open(cache_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
-            # 检查缓存是否过期 (24小时)
+            # 检查缓存是否过期 (12小时，改为更短的缓存有效期)
             cache_age = time.time() - data.get('timestamp', 0)
-            if cache_age > 86400:  # 24 * 60 * 60
+            if cache_age > 43200:  # 12 * 60 * 60
                 print(f"[Info] 缓存已过期 ({cache_age / 3600:.1f} 小时), 将重新索引")
                 return False
 
@@ -787,13 +891,20 @@ class ChineseLauncher:
 # ==================== 测试代码 ====================
 
 if __name__ == '__main__':
-    launcher = ChineseLauncher()
-
     print("=" * 60)
-    print("中文智能启动器测试")
+    print("中文智能启动器性能测试")
     print("=" * 60)
 
-    # 测试用例
+    # 初始化启动器（自动启动后台索引）
+    print("\n[测试] 初始化启动器...")
+    init_start = time.time()
+    launcher = ChineseLauncher(enable_cache=True, auto_index=True)
+    init_time = time.time() - init_start
+    print(f"[结果] 初始化耗时: {init_time:.3f}s (非阻塞)")
+
+    # 测试搜索（会等待后台索引或执行快速索引）
+    print("\n[测试] 执行搜索（测试等待后台索引）...")
+    search_start = time.time()
     test_queries = [
         "记事本",      # 中文
         "jishiben",    # 全拼
@@ -802,9 +913,20 @@ if __name__ == '__main__':
         "chrome",      # 浏览器
     ]
 
+    all_results = []
     for query in test_queries:
-        print(f"\n搜索: {query}")
-        results = launcher.search(query, limit=3)
+        query_start = time.time()
+        results = launcher.search(query, limit=3, wait_for_index=True)
+        query_time = time.time() - query_start
+        print(f"\n搜索: {query} (耗时: {query_time:.3f}s)")
         for i, candidate in enumerate(results, 1):
             print(f"  {i}. {candidate.display_name} ({candidate.source})")
-            print(f"     {candidate.executable_path}")
+        all_results.extend(results)
+
+    total_search_time = time.time() - search_start
+    print(f"\n[统计] 总搜索时间: {total_search_time:.3f}s")
+    print(f"[统计] 已索引程序数: {len(launcher._candidates)}")
+    print(f"[统计] 完整索引完成: {launcher._full_indexed}")
+
+    # 清理资源
+    launcher.cleanup()
